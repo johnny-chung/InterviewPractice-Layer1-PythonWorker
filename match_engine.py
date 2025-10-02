@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Dict, List
 
 import numpy as np
@@ -34,13 +35,17 @@ def _cosine_similarity_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 
 def calculate_match(candidate_skills: List[Dict], requirements: List[Dict], threshold: float = 0.5) -> Dict:
-    """Compute weighted coverage summary between candidate skills and job requirements.
+    """Compute weighted coverage summary with explicit vs inferred cap.
 
-    Notes:
-    - We prefer exact lexical matches when deciding whether a requirement is satisfied.
-      High semantic similarity alone is not enough to mark a requirement as covered.
-      This keeps behavior predictable for tests and UI while still exposing similarity
-      values in the details.
+        Behavior additions:
+        - Exact lexical match gating (existing logic) retained.
+        - If both explicit and inferred requirements exist, inferred requirements may
+            contribute at most 20% of the final score mass. This is achieved by computing
+            raw weighted sums separately (explicit vs inferred) then blending:
+                     final_score = explicit_score + min(inferred_score, 0.2 * (explicit_score + inferred_score))
+            followed by re-normalization to keep scale in [0,1]. Implementation uses
+            weight partitioning to avoid double scaling.
+        - If only inferred or only explicit requirements exist, normal behavior applies.
     """
     if not requirements:
         # No requirements means no meaningful score; return empty scaffolding.
@@ -53,6 +58,10 @@ def calculate_match(candidate_skills: List[Dict], requirements: List[Dict], thre
                 'details': [],
             }
         }
+
+    # New behavior toggle: by default inferred requirements are ignored for final score.
+    raw_flag = os.getenv('USE_INFERRED_REQUIREMENTS', 'false').strip().lower()
+    use_inferred = raw_flag in {'1', 'true', 'yes', 'on'}
 
     # Convert raw dicts into token lists we can embed.
     requirement_texts = _normalize_skills(requirements, 'skill')
@@ -68,12 +77,17 @@ def calculate_match(candidate_skills: List[Dict], requirements: List[Dict], thre
     strengths = []  # Requirements covered above the match threshold.
     gaps = []       # Requirements that remain unmet or weakly covered.
     details = []    # Full per-requirement breakdown returned to the client.
-    weighted_sum = 0.0
-    total_weight = 0.0
+    explicit_weighted_sum = 0.0
+    inferred_weighted_sum = 0.0
+    explicit_total_weight = 0.0
+    inferred_total_weight = 0.0
 
     for idx, requirement in enumerate(requirements):
         weight = float(requirement.get('importance') or 0.5)
-        total_weight += weight
+        if requirement.get('inferred'):
+            inferred_total_weight += weight
+        else:
+            explicit_total_weight += weight
         # Pull the similarity row for the current requirement (handles empty matrices).
         row = similarity[idx] if similarity.size else np.zeros(len(skill_texts))
         if row.size:
@@ -103,12 +117,30 @@ def calculate_match(candidate_skills: List[Dict], requirements: List[Dict], thre
         details.append(detail)
 
         if effective_sim >= threshold:
-            strengths.append(detail)  # Requirement is satisfied above threshold.
-            weighted_sum += weight * effective_sim  # Weight contributes proportionally to overall score.
+            strengths.append(detail)
+            if requirement.get('inferred'):
+                if use_inferred:
+                    inferred_weighted_sum += weight * effective_sim
+            else:
+                explicit_weighted_sum += weight * effective_sim
         else:
-            gaps.append(detail)  # Capture unmet requirements for downstream UI messaging.
+            gaps.append(detail)
+    # Combine explicit + (optionally) inferred ensuring inferred <= 20% cap when enabled.
+    if use_inferred:
+        total_weight = explicit_total_weight + inferred_total_weight
+        if total_weight == 0:
+            overall_score = 0.0
+        else:
+            raw_explicit = explicit_weighted_sum / total_weight if total_weight else 0.0
+            raw_inferred = inferred_weighted_sum / total_weight if total_weight else 0.0
+            cap = 0.2 * (raw_explicit + raw_inferred)
+            capped_inferred = min(raw_inferred, cap)
+            overall_score = raw_explicit + capped_inferred
+    else:
+        # Ignore inferred entirely: denominator uses only explicit weight (avoid zero div).
+        total_weight = explicit_total_weight or 1.0
+        overall_score = (explicit_weighted_sum / total_weight) if total_weight else 0.0
 
-    overall_score = weighted_sum / total_weight if total_weight else 0.0
     # Round values the same way we present in the API to keep consistency for clients.
     return {
         'score': round(overall_score, 3),

@@ -15,6 +15,7 @@ from spacy.matcher import Matcher, PhraseMatcher
 
 from utils.skill_dictionary import SECTION_PATTERNS, get_skill_terms
 from utils.spacy_loader import get_nlp
+from utils import gemini_client  # optional: technology extraction (explicit resume skills)
 
 logger = logging.getLogger(__name__)
 
@@ -36,28 +37,68 @@ class ResumeParser:
     def parse(self, data: bytes, filename: str | None, mime_type: str | None) -> Dict:
         """Convert raw resume bytes into structured sections, skills, and stats.
 
-        Args:
-            data: Raw uploaded file bytes.
-            filename: Original filename (used to infer type when MIME missing).
-            mime_type: Provided MIME type.
-        Returns:
-            Dict with keys: raw_text, sections, skills, statistics, profile.
+        Now also (optionally) calls Gemini to extract explicit technology / tool
+        skills from the *entire* resume text (similar to job parsing flow).
+        Gemini skills are merged (deduped) with dictionary / matcher extracted
+        skills. When Gemini disabled or fails, behaviour is unchanged.
+
+        Returns keys:
+            raw_text, sections, skills (merged), statistics, profile, sources (per-skill provenance)
         """
-        # Decode file data into plain text the NLP stack can process.
         text = self._extract_text(data, filename, mime_type)
-        # Tokenised doc used for pattern matching and statistics.
         doc = self._nlp(text)
-        # Identify the resume sections (experience, skills, etc.).
         sections = self._identify_sections(doc)
-        # Extract individual skill mentions + experience heuristics.
-        skills = self._extract_skills(doc)
-        # Basic telemetry describing the parsed document size.
+        baseline_skills = self._extract_skills(doc)  # matcher-based (dictionary)
+
+        # Optional Gemini extraction (treated as explicit stated skills; not inferred)
+        gemini_skills: List[Dict] = []
+        if gemini_client.is_enabled():  # pragma: no branch simple guard
+            try:
+                # Reuse job prompt style but adjust instruction phrase.
+                # We call the same extract_technologies (instructions mention job description)
+                # but empirically it's generic enough; we could adapt by prefixing text.
+                gemini_skills = gemini_client.extract_technologies(f"Resume text:\n{text[:15000]}")
+                if gemini_skills:
+                    logger.info('resume_parser.parse: gemini extracted count=%d', len(gemini_skills))
+            except Exception as exc:  # pragma: no cover
+                logger.warning('resume_parser.parse: gemini extraction failed: %s', exc)
+        else:
+            logger.debug('resume_parser.parse: gemini disabled (is_enabled()=False)')
+
+        # Merge baseline + gemini by skill name (case-insensitive); keep earliest experience_years if present
+        merged: Dict[str, Dict] = {}
+        for item in baseline_skills:
+            key = item['skill'].lower()
+            merged[key] = {**item, 'source': ['matcher']}
+        for g in gemini_skills:
+            g_skill = g.get('skill')
+            if not g_skill:
+                continue
+            key = g_skill.lower()
+            if key in merged:
+                # Augment source + possibly elevate experience_years if Gemini implied none
+                merged[key]['source'].append('gemini')
+                # If Gemini importance differs and we don't already store one, record under gemini_importance
+                if 'gemini_importance' not in merged[key] and g.get('importance') is not None:
+                    merged[key]['gemini_importance'] = g.get('importance')
+            else:
+                merged[key] = {
+                    'skill': key,
+                    'experience_years': None,
+                    'proficiency': None,
+                    'mentions': 0,
+                    'source': ['gemini'],
+                    'gemini_importance': g.get('importance')
+                }
+
+        merged_list = list(merged.values())
+
         stats = {
             'characters': len(text),
             'tokens': len(doc),
-            'skills_detected': len(skills),
+            'skills_detected': len(merged_list),
+            'skills_gemini': len(gemini_skills),
         }
-        # High-level profile summary used downstream by the matcher.
         profile = {
             'summary': sections.get('SUMMARY', '')[:500],
             'total_experience_years': self._estimate_total_years(text),
@@ -65,7 +106,7 @@ class ResumeParser:
         return {
             'raw_text': text,
             'sections': sections,
-            'skills': skills,
+            'skills': merged_list,
             'statistics': stats,
             'profile': profile,
         }

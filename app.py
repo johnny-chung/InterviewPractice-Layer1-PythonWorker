@@ -26,7 +26,12 @@ from parsers.job_parser import job_parser
 from match_engine import calculate_match
 
 logger = logging.getLogger(__name__)  # Shared logger for request handlers.
-logging.basicConfig(level=logging.INFO)
+# Ensure consistent logging format and force reconfiguration in container environments
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s:%(name)s:%(message)s',
+    force=True,
+)
 
 app = FastAPI(title='Layer1 NLP Service', version='0.1.0')  # Keep version here to surface in docs.
 
@@ -119,7 +124,7 @@ def parse_job(payload: JobPayload) -> dict:
     """Parse job description file or raw text and derive requirement list.
 
     Request: JobPayload (must include content_b64 OR text)
-    Success 200: { requirements, summary, highlights, onet }
+    Success 200: { requirements, soft_skills }
     Errors: 400 invalid_base64 | content_required
     """
     data = None
@@ -132,11 +137,11 @@ def parse_job(payload: JobPayload) -> dict:
     if not data and not payload.text:
         raise HTTPException(status_code=400, detail='content_required')
     result = job_parser.parse(data, payload.text, payload.filename, payload.mime_type, payload.title)
+    reqs = result['requirements']
+    softs = result.get('soft_skills') or []
     return {
-        'requirements': result['requirements'],
-        'summary': result['summary'],
-        'highlights': result['highlights'],
-        'onet': result['onet'],
+        'requirements': reqs,
+        'soft_skills': softs,
     }
 
 

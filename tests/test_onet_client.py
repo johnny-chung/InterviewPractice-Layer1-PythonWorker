@@ -3,7 +3,13 @@ import re
 import pytest
 import requests
 
-from utils.onet_client import is_enabled, search_onet_code, fetch_onet_skills, ONET_ENDPOINT
+from utils.onet_client import (
+    is_enabled,
+    search_onet_code,
+    fetch_onet_skills,
+    search_onet_codes_multi,
+    ONET_ENDPOINT,
+)
 
 
 pytestmark = [pytest.mark.integration]
@@ -56,5 +62,17 @@ def test_fetch_onet_skills_for_known_code():
         assert set(["skill", "importance", "source"]).issubset(item.keys())
         assert item["source"] == "onet"
         assert 0.0 <= float(item["importance"]) <= 1.0
+
+
+@pytest.mark.skipif(not is_enabled(), reason="ONET credentials not configured in environment")
+def test_search_onet_codes_multi_single_full_title():
+    # Using a multi-word title should only perform a single full-title query internally.
+    # We cannot easily assert number of HTTP calls here without monkeypatching, so we
+    # assert that we still obtain at least one valid SOC code and formatting is correct.
+    codes = search_onet_codes_multi("Senior Software Engineer")
+    assert isinstance(codes, list)
+    assert len(codes) > 0, "Expected at least one SOC code from multi search"
+    for code in codes:
+        assert re.match(r"^\d{2}-\d{4}\.\d{2}$", code), f"Unexpected SOC code format: {code}"
 
 

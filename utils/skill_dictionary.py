@@ -5,8 +5,10 @@ Exposes get_skill_terms() which returns a cached merged set of skills drawn from
   2. Optional O*NET enrichment (when credentials present)
 
 Environment variables:
-  ONET_USER / ONET_PASSWORD   -> enable O*NET enrichment
-  ONET_SKILL_CODES            -> comma separated SOC codes to query (defaults provided)
+    ONET_USER / ONET_PASSWORD            -> enable O*NET enrichment
+    ONET_USE_BRIGHT_OUTLOOK (default true) -> when not 'false', fetch occupation codes from Bright Outlook API
+    ONET_BRIGHT_OUTLOOK_CATEGORY         -> category code for Bright Outlook (grow | rapid | new), default 'grow'
+    # Deprecated/ignored: ONET_SKILL_CODES (manual SOC list superseded by dynamic Bright Outlook)
 """
 
 import logging
@@ -27,6 +29,8 @@ _FALLBACK_SKILL_TERMS = [
     'graphql', 'rest api', 'grpc', 'soap', 'xml', 'json',
     'spring', 'spring boot', 'hibernate', 'django', 'flask', 'fastapi', 'express', 'laravel', 'rails',
     'next.js', 'nuxt', 'svelte', 'alpine.js', 'jquery', 'backbone',
+    'redux', 'redux toolkit', 'mobx', 'zustand', 'recoil', 'context api', 'state management',
+    'websocket', 'websockets', 'socket.io', 'signalr',
     'android', 'ios', 'kotlin', 'flutter', 'react native', 'xamarin', 'cordova',
     'unity', 'unreal engine', 'game development',
 
@@ -122,6 +126,7 @@ _FALLBACK_SKILL_TERMS = [
     'leadership', 'mentoring', 'coaching', 'team building', 'communication', 'presentation skills',
     'strategic planning', 'problem solving', 'critical thinking', 'analytical skills',
     'conflict resolution', 'time management', 'decision making', 'adaptability',
+    'object oriented programming', 'oop', 'solid principles', 'observer pattern', 'publish subscribe',
 
     # Emerging technologies & misc
     'blockchain', 'smart contracts', 'web3', 'metaverse', 'iot', 'edge computing',
@@ -129,37 +134,20 @@ _FALLBACK_SKILL_TERMS = [
     'ethical ai', 'data privacy', 'explainable ai', 'digital twin',
 ]
 
-DEFAULT_SKILL_CODES = [
-    '15-1252.00',  # Software Developers
-    '15-1241.00',  # Computer Network Architects
-    '15-1245.00',  # Database Administrators and Architects
-    '15-1221.00',  # Computer and Information Research Scientists
-    '15-1212.00',  # Information Security Analysts
-    '15-1232.00',  # Computer User Support Specialists
-    '15-2041.00',  # Statisticians / Data Scientists
-    '17-2112.00',  # Industrial Engineers
-    '11-2021.00',  # Marketing Managers
-    '11-1021.00',  # General and Operations Managers
-    '13-1121.00',  # Meeting, Convention, and Event Planners
-    '13-1161.00',  # Market Research Analysts and Marketing Specialists
-    '29-1141.00',  # Registered Nurses
-    '11-3121.00',  # Human Resources Managers
-    '27-1021.00',  # Commercial and Industrial Designers
-    '13-2011.00',  # Accountants and Auditors
-]  # Base SOC codes spanning engineering, data, business, and operations.
+DEFAULT_SKILL_CODES = []  # Legacy placeholder; no longer used.
 
 
-def _skill_codes_from_env() -> List[str]:
-    """Return SOC codes to fetch.
+def _bright_outlook_codes() -> List[str]:
+    """Fetch Bright Outlook occupation codes based on category.
 
-    Reads ONET_SKILL_CODES (comma separated). Falls back to DEFAULT_SKILL_CODES when unset or empty.
-    Returns: list[str] of SOC codes.
+    Returns empty list on failure (caller will fallback to static skills only).
     """
-    raw = os.getenv('ONET_SKILL_CODES')
-    if not raw:
-        return DEFAULT_SKILL_CODES
-    codes = [code.strip() for code in raw.split(',') if code.strip()]
-    return codes or DEFAULT_SKILL_CODES
+    category = os.getenv('ONET_BRIGHT_OUTLOOK_CATEGORY') or 'grow'
+    try:
+        return onet_client.fetch_bright_outlook_codes(category=category)
+    except Exception as exc:
+        logger.warning('Failed to fetch Bright Outlook codes: %s', exc)
+        return []
 
 
 @lru_cache()
@@ -170,27 +158,47 @@ def load_skill_terms() -> List[str]:
     Side effects: Logs counts and source (fallback vs O*NET merge).
     """
     base_terms = set(_FALLBACK_SKILL_TERMS)
-    if onet_client.is_enabled():
-        terms: List[str] = []
-        codes = _skill_codes_from_env()
-        for code in codes:
-            for skill in onet_client.fetch_onet_skills(code):
-                name = skill.get('skill') or skill.get('name')
-                if name:
-                    terms.append(name.lower())
-        unique_terms = set(terms)
-        if unique_terms:
-            merged = sorted(base_terms | unique_terms)
-            logger.info(
-                'Loaded %s O*NET skill terms (merged with %s fallback terms) using codes: %s',
-                len(unique_terms), len(base_terms), codes,
-            )
-            return merged
-        logger.warning('O*NET credentials present but no skills returned; using fallback list only.')
-        return sorted(base_terms)
-    else:
+    if not onet_client.is_enabled():
         logger.info('O*NET credentials not detected; using fallback skill list.')
         return sorted(base_terms)
+
+    if (os.getenv('ONET_USE_BRIGHT_OUTLOOK', 'true').lower() == 'false'):
+        logger.info('Bright Outlook enrichment disabled via ONET_USE_BRIGHT_OUTLOOK=false; using fallback only.')
+        return sorted(base_terms)
+
+    codes = _bright_outlook_codes()
+    if not codes:
+        logger.info('No Bright Outlook codes retrieved; using fallback skill list.')
+        return sorted(base_terms)
+    logger.info('Bright Outlook occupation codes (%d): %s', len(codes), ', '.join(codes))
+
+    collected: List[str] = []
+    codes_with_any_skills = 0
+    total_skill_items = 0
+    for code in codes:
+        try:
+            skills = onet_client.fetch_onet_skills(code) or []
+        except Exception as exc:  # Extra safety; underlying client already defensive.
+            logger.debug('Skipping O*NET code %s due to fetch error: %s', code, exc)
+            continue
+        if skills:
+            codes_with_any_skills += 1
+        for skill in skills:
+            name = skill.get('skill') or skill.get('name')
+            if not name:
+                continue
+            total_skill_items += 1
+            collected.append(name.lower())
+    unique_terms = set(collected)
+    if unique_terms:
+        merged = sorted(base_terms | unique_terms)
+        logger.info(
+            'Loaded %d unique O*NET skill terms (%d raw items) from %d/%d Bright Outlook occupations (merged with %d fallback).',
+            len(unique_terms), total_skill_items, codes_with_any_skills, len(codes), len(base_terms)
+        )
+        return merged
+    logger.warning('Bright Outlook provided %d occupation codes but produced no skills; using fallback only.', len(codes))
+    return sorted(base_terms)
 
 
 def get_skill_terms() -> List[str]:
