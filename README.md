@@ -1,6 +1,34 @@
-# Python Worker
+<div align="center">
 
-FastAPI service that parses resumes/jobs and computes matches.
+# Python Worker (NLP / Matching Microservice)
+
+High‑throughput FastAPI service providing resume & job parsing, O\*NET enrichment, SBERT embeddings, optional Gemini augmentation, and match scoring utilities for the Layer1 backend.
+
+[![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-ASGI-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![spaCy](https://img.shields.io/badge/spaCy-NLP-09A3D5)](https://spacy.io/)
+[![pdfminer.six](https://img.shields.io/badge/pdfminer.six-Extraction-FFB400)](https://github.com/pdfminer/pdfminer.six)
+[![python-docx](https://img.shields.io/badge/python--docx-DOCX%20Parsing-295397)](https://python-docx.readthedocs.io/)
+[![SentenceTransformers](https://img.shields.io/badge/SBERT-Embeddings-1B1F23)](https://www.sbert.net/)
+[![O*NET](https://img.shields.io/badge/O*NET-Requirements-005A9C)](https://www.onetcenter.org/)
+[![Gemini](https://img.shields.io/badge/Gemini-Optional%20LLM-4285F4?logo=googlecloud&logoColor=white)](https://ai.google.dev/)
+[![Pytest](https://img.shields.io/badge/Pytest-Tests-0A9EDC?logo=pytest&logoColor=white)](https://pytest.org/)
+
+</div>
+
+## Role in the System
+
+The Node.js backend (`../backend`) delegates computationally heavy steps here:
+
+- PDF / DOCX extraction
+- Section & skill detection (heuristics + pattern + optional Gemini)
+- Job requirement extraction & O\*NET enrichment (technology + soft skills)
+- Embedding generation (SBERT) with deterministic hash fallback
+- Match scoring helpers consumed by queue workers / tests
+
+Communication: direct HTTP (`PYTHON_SERVICE_URL`) from backend or invoked internally by queue processors.
+
+Refer to `../layer1_backend_and_ai_design.md` for architecture details.
 
 ## Prerequisites
 
@@ -181,3 +209,49 @@ Disable by removing `GEMINI_API_KEY` (no code changes needed) or uninstalling th
 - O\*NET tests are marked with the `integration` marker and are skipped if ONET_USER/ONET_PASSWORD are not configured.
 - If you see spaCy model errors locally, run: `python -m spacy download en_core_web_sm`.
 - You can run pytest from layer1 (root) or from python-worker; .env is located by tests/conftest.py regardless of the working directory.
+
+---
+
+## Docker / Compose Usage
+
+The worker is referenced by `backend/docker-compose.yml` as service `python_worker`.
+
+Standalone build & run:
+
+```bash
+docker build -t layer1-python-worker .
+docker run --rm -p 8000:8000 --env-file .env layer1-python-worker
+```
+
+Via existing compose (from `backend` directory):
+
+```bash
+docker compose up -d python_worker
+```
+
+Check readiness at `http://localhost:8000/docs` (FastAPI Swagger UI) or a `/health` endpoint if implemented.
+
+## Environment Highlights
+
+| Variable                  | Purpose                                           | Notes                                     |
+| ------------------------- | ------------------------------------------------- | ----------------------------------------- |
+| ONET_USER / ONET_PASSWORD | O\*NET API credentials                            | Needed for enrichment & integration tests |
+| ONET_MIN_RELEVANCE        | Filter importance / relevance                     | 0–1 or 0–100 accepted                     |
+| GEMINI_API_KEY            | Enable Gemini technology extraction               | Omit to disable                           |
+| GEMINI_MODEL              | Override default Gemini model                     | Optional                                  |
+| USE_INFERRED_REQUIREMENTS | Include inferred requirements in scoring (capped) | Mirrors backend flag                      |
+
+## Dev Tips
+
+- Run `pytest -m 'not integration'` for fast feedback loops.
+- First run downloads spaCy model / SBERT – subsequent starts are faster.
+- Hash fallback activates automatically if transformer load fails (logged warning).
+
+## Cross References
+
+- Backend Orchestrator: `../backend/README.md`
+- System Design: `../layer1_backend_and_ai_design.md`
+
+---
+
+_README enhanced 2025-10-02: added badges, role overview, docker usage, env highlights._
